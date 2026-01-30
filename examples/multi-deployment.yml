@@ -1,0 +1,26 @@
+kind: Deployment
+spec:
+    name: web
+    image: nginx:alpine
+    replicas: 2
+    resources:
+        cpu: 100m
+        memory: 128Mi
+---
+kind: Deployment
+spec:
+    name: api
+    image: httpd:alpine
+    replicas: 2
+    resources:
+        cpu: 200m
+        memory: 256Mi
+---
+kind: Deployment
+spec:
+    name: cache
+    image: redis:alpine
+    replicas: 1
+    resources:
+        cpu: 50m
+        memory: 64Mi

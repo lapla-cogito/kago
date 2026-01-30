@@ -1,0 +1,9 @@
+name: cache_cargo
+description: Cache Rust/Cargo build artifacts using Swatinem/rust-cache
+runs:
+    using: composite
+    steps:
+        - name: Cache Rust dependencies and build artifacts
+          uses: Swatinem/rust-cache@v2
+          with:
+              cache-on-failure: true
