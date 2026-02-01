@@ -25,6 +25,8 @@ enum Commands {
     Serve {
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
+        #[arg(long, default_value = "first-fit", value_parser = parse_scheduling_strategy)]
+        scheduler: crate::controller::SchedulingStrategy,
     },
     /// Start the agent on a worker node
     Agent {
@@ -65,16 +67,31 @@ enum Commands {
     },
 }
 
+fn parse_scheduling_strategy(s: &str) -> Result<crate::controller::SchedulingStrategy, String> {
+    match s.to_lowercase().as_str() {
+        "first-fit" | "firstfit" | "first_fit" => {
+            Ok(crate::controller::SchedulingStrategy::FirstFit)
+        }
+        "best-fit" | "bestfit" | "best_fit" | "binpacking" | "bin-packing" => {
+            Ok(crate::controller::SchedulingStrategy::BestFit)
+        }
+        "least-allocated" | "leastallocated" | "least_allocated" | "spread" => {
+            Ok(crate::controller::SchedulingStrategy::LeastAllocated)
+        }
+        "balanced" | "balance" => Ok(crate::controller::SchedulingStrategy::Balanced),
+        _ => Err(format!(
+            "Unknown scheduling strategy '{}'. Available: first-fit, best-fit, least-allocated, balanced",
+            s
+        )),
+    }
+}
+
 fn main() {
     let cli = <Cli as clap::Parser>::parse();
 
     match cli.command {
-        Some(Commands::Serve { port }) => {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_server(port));
+        Some(Commands::Serve { port, scheduler }) => {
+            run_with_runtime(run_server(port, scheduler));
         }
         Some(Commands::Agent {
             name,
@@ -84,11 +101,7 @@ fn main() {
             cpu,
             memory,
         }) => {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_agent(name, master, port, address, cpu, memory));
+            run_with_runtime(run_agent(name, master, port, address, cpu, memory));
         }
         Some(Commands::Apply { file, server }) => {
             if let Err(e) = run_apply(&file, &server) {
@@ -109,16 +122,26 @@ fn main() {
             }
         }
         None => {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_server(DEFAULT_PORT));
+            run_with_runtime(run_server(
+                DEFAULT_PORT,
+                crate::controller::SchedulingStrategy::default(),
+            ));
         }
     }
 }
 
-async fn run_server(port: u16) {
+fn run_with_runtime<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
+async fn run_server(port: u16, scheduler: crate::controller::SchedulingStrategy) {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -127,11 +150,13 @@ async fn run_server(port: u16) {
         .init();
 
     tracing::info!("Starting Kago Control Plane");
+    tracing::info!("Scheduling strategy: {:?}", scheduler);
 
     let store = crate::store::new_shared_store();
-    let controller = std::sync::Arc::new(crate::controller::Controller::new(
-        std::sync::Arc::clone(&store),
-    ));
+    let controller = std::sync::Arc::new(
+        crate::controller::Controller::new(std::sync::Arc::clone(&store))
+            .with_scheduling_strategy(scheduler),
+    );
     let app = crate::api::create_router(store, std::sync::Arc::clone(&controller));
 
     let controller_handle = tokio::spawn(async move {
