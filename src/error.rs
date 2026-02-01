@@ -21,3 +21,11 @@ pub enum CliError {
 }
 
 pub type CliResult<T> = std::result::Result<T, CliError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentError {
+    #[error("Registration failed: {0}")]
+    RegistrationFailed(String),
+}
+
+pub type AgentResult<T> = std::result::Result<T, AgentError>;

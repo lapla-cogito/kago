@@ -290,6 +290,28 @@ impl CliClient {
             Err(crate::error::CliError::HttpError(error_text))
         }
     }
+
+    pub fn get_nodes(&self) -> crate::error::CliResult<String> {
+        let url = format!("{}/nodes", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| crate::error::CliError::HttpError(e.to_string()))?;
+
+        if response.status().is_success() {
+            let text = response
+                .text()
+                .map_err(|e| crate::error::CliError::HttpError(e.to_string()))?;
+            Ok(text)
+        } else {
+            let error_text = response
+                .text()
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            Err(crate::error::CliError::HttpError(error_text))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,19 @@ pub struct Resources {
     pub memory_mb: u32,
 }
 
+impl Resources {
+    pub fn subtract(&self, other: &Resources) -> Resources {
+        Resources {
+            cpu_millis: self.cpu_millis.saturating_sub(other.cpu_millis),
+            memory_mb: self.memory_mb.saturating_sub(other.memory_mb),
+        }
+    }
+
+    pub fn fits(&self, request: &Resources) -> bool {
+        self.cpu_millis >= request.cpu_millis && self.memory_mb >= request.memory_mb
+    }
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PodStatus {
@@ -26,6 +39,8 @@ pub struct Pod {
     pub deployment_name: Option<String>,
     pub status: PodStatus,
     pub container_id: Option<String>,
+    #[serde(default)]
+    pub node_name: Option<String>,
 }
 
 impl Pod {
@@ -38,6 +53,7 @@ impl Pod {
             deployment_name: Some(deployment.name.clone()),
             status: PodStatus::Pending,
             container_id: None,
+            node_name: None,
         }
     }
 }
@@ -98,6 +114,7 @@ pub struct PodResponse {
     pub image: String,
     pub status: PodStatus,
     pub deployment_name: Option<String>,
+    pub node_name: Option<String>,
 }
 
 impl From<&Pod> for PodResponse {
@@ -108,6 +125,120 @@ impl From<&Pod> for PodResponse {
             image: pod.image.clone(),
             status: pod.status,
             deployment_name: pod.deployment_name.clone(),
+            node_name: pod.node_name.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeStatus {
+    #[default]
+    Unknown,
+    Ready,
+    NotReady,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Node {
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    pub capacity: Resources,
+    pub allocatable: Resources,
+    pub used: Resources,
+    pub status: NodeStatus,
+    #[serde(with = "chrono::serde::ts_milliseconds")]
+    pub last_heartbeat: chrono::DateTime<chrono::Utc>,
+}
+
+impl Node {
+    pub fn new(name: String, address: String, port: u16, capacity: Resources) -> Self {
+        Self {
+            name,
+            address,
+            port,
+            capacity,
+            allocatable: capacity,
+            used: Resources::default(),
+            status: NodeStatus::Ready,
+            last_heartbeat: chrono::Utc::now(),
+        }
+    }
+
+    pub fn available_resources(&self) -> Resources {
+        self.allocatable.subtract(&self.used)
+    }
+
+    pub fn can_fit(&self, request: &Resources) -> bool {
+        self.available_resources().fits(request)
+    }
+
+    pub fn endpoint(&self) -> String {
+        format!("http://{}:{}", self.address, self.port)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegisterNodeRequest {
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    pub capacity: Resources,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HeartbeatRequest {
+    pub used: Resources,
+    pub pod_statuses: Vec<PodStatusReport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PodStatusReport {
+    pub pod_id: uuid::Uuid,
+    pub status: PodStatus,
+    pub container_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NodeResponse {
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    pub status: NodeStatus,
+    pub capacity: Resources,
+    pub allocatable: Resources,
+    pub used: Resources,
+    pub available: Resources,
+}
+
+impl From<&Node> for NodeResponse {
+    fn from(node: &Node) -> Self {
+        Self {
+            name: node.name.clone(),
+            address: node.address.clone(),
+            port: node.port,
+            status: node.status,
+            capacity: node.capacity,
+            allocatable: node.allocatable,
+            used: node.used,
+            available: node.available_resources(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CreatePodOnNodeRequest {
+    pub pod_id: uuid::Uuid,
+    pub name: String,
+    pub image: String,
+    pub resources: Resources,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentPodStatus {
+    pub pod_id: uuid::Uuid,
+    pub name: String,
+    pub status: PodStatus,
+    pub container_id: Option<String>,
 }
