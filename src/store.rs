@@ -2,6 +2,7 @@
 pub struct Store {
     deployments: std::collections::HashMap<String, crate::models::Deployment>,
     pods: std::collections::HashMap<uuid::Uuid, crate::models::Pod>,
+    nodes: std::collections::HashMap<String, crate::models::Node>,
 }
 
 impl Store {
@@ -17,8 +18,8 @@ impl Store {
         self.deployments.get(name)
     }
 
-    pub fn list_deployments(&self) -> Vec<&crate::models::Deployment> {
-        self.deployments.values().collect()
+    pub fn list_deployments(&self) -> Vec<crate::models::Deployment> {
+        self.deployments.values().cloned().collect()
     }
 
     pub fn delete_deployment(&mut self, name: &str) -> Option<crate::models::Deployment> {
@@ -33,14 +34,19 @@ impl Store {
         self.pods.get(id)
     }
 
-    pub fn list_pods(&self) -> Vec<&crate::models::Pod> {
-        self.pods.values().collect()
+    pub fn get_pod_mut(&mut self, id: &uuid::Uuid) -> Option<&mut crate::models::Pod> {
+        self.pods.get_mut(id)
     }
 
-    pub fn list_pods_for_deployment(&self, deployment_name: &str) -> Vec<&crate::models::Pod> {
+    pub fn list_pods(&self) -> Vec<crate::models::Pod> {
+        self.pods.values().cloned().collect()
+    }
+
+    pub fn list_pods_for_deployment(&self, deployment_name: &str) -> Vec<crate::models::Pod> {
         self.pods
             .values()
             .filter(|p| p.deployment_name.as_deref() == Some(deployment_name))
+            .cloned()
             .collect()
     }
 
@@ -57,9 +63,9 @@ impl Store {
         }
     }
 
-    pub fn update_pod_container_id(&mut self, id: &uuid::Uuid, container_id: String) -> bool {
-        if let Some(pod) = self.pods.get_mut(id) {
-            pod.container_id = Some(container_id);
+    pub fn assign_pod_to_node(&mut self, pod_id: &uuid::Uuid, node_name: &str) -> bool {
+        if let Some(pod) = self.pods.get_mut(pod_id) {
+            pod.node_name = Some(node_name.to_string());
             true
         } else {
             false
@@ -112,11 +118,101 @@ impl Store {
             .collect()
     }
 
-    pub fn get_pending_pods(&self) -> Vec<&crate::models::Pod> {
+    pub fn get_unassigned_pods(&self) -> Vec<crate::models::Pod> {
         self.pods
             .values()
-            .filter(|p| p.status == crate::models::PodStatus::Pending)
+            .filter(|p| {
+                p.node_name.is_none()
+                    && matches!(
+                        p.status,
+                        crate::models::PodStatus::Pending | crate::models::PodStatus::Creating
+                    )
+            })
+            .cloned()
             .collect()
+    }
+
+    pub fn register_node(&mut self, node: crate::models::Node) {
+        self.nodes.insert(node.name.clone(), node);
+    }
+
+    pub fn get_node(&self, name: &str) -> Option<&crate::models::Node> {
+        self.nodes.get(name)
+    }
+
+    pub fn list_nodes(&self) -> Vec<crate::models::Node> {
+        self.nodes.values().cloned().collect()
+    }
+
+    pub fn delete_node(&mut self, name: &str) -> Option<crate::models::Node> {
+        self.nodes.remove(name)
+    }
+
+    pub fn update_node_heartbeat(&mut self, name: &str) -> bool {
+        if let Some(node) = self.nodes.get_mut(name) {
+            node.last_heartbeat = chrono::Utc::now();
+            node.status = crate::models::NodeStatus::Ready;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn update_node_status(&mut self, name: &str, status: crate::models::NodeStatus) -> bool {
+        if let Some(node) = self.nodes.get_mut(name) {
+            node.status = status;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn update_node_resources(&mut self, name: &str, used: crate::models::Resources) -> bool {
+        if let Some(node) = self.nodes.get_mut(name) {
+            node.used = used;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_ready_nodes(&self) -> Vec<crate::models::Node> {
+        self.nodes
+            .values()
+            .filter(|n| n.status == crate::models::NodeStatus::Ready)
+            .cloned()
+            .collect()
+    }
+
+    pub fn allocate_resources_on_node(
+        &mut self,
+        node_name: &str,
+        resources: &crate::models::Resources,
+    ) -> bool {
+        if let Some(node) = self.nodes.get_mut(node_name) {
+            if !node.can_fit(resources) {
+                return false;
+            }
+            node.used.cpu_millis += resources.cpu_millis;
+            node.used.memory_mb += resources.memory_mb;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn deallocate_resources_on_node(
+        &mut self,
+        node_name: &str,
+        resources: &crate::models::Resources,
+    ) -> bool {
+        if let Some(node) = self.nodes.get_mut(node_name) {
+            node.used.cpu_millis = node.used.cpu_millis.saturating_sub(resources.cpu_millis);
+            node.used.memory_mb = node.used.memory_mb.saturating_sub(resources.memory_mb);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -167,6 +263,7 @@ mod tests {
             deployment_name: None,
             status: crate::models::PodStatus::Pending,
             container_id: None,
+            node_name: None,
         };
         let pod_id = pod.id;
 
@@ -208,5 +305,75 @@ mod tests {
 
         let count = store.count_active_pods_for_deployment("web");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_node_crud() {
+        let mut store = Store::new();
+
+        let node = crate::models::Node::new(
+            "worker-1".to_string(),
+            "localhost".to_string(),
+            8081,
+            crate::models::Resources {
+                cpu_millis: 4000,
+                memory_mb: 8192,
+            },
+        );
+
+        store.register_node(node);
+        assert!(store.get_node("worker-1").is_some());
+        assert_eq!(store.list_nodes().len(), 1);
+
+        store.update_node_heartbeat("worker-1");
+        assert_eq!(
+            store.get_node("worker-1").unwrap().status,
+            crate::models::NodeStatus::Ready
+        );
+
+        store.delete_node("worker-1");
+        assert!(store.get_node("worker-1").is_none());
+    }
+
+    #[test]
+    fn test_node_resource_allocation() {
+        let mut store = Store::new();
+
+        let node = crate::models::Node::new(
+            "worker-1".to_string(),
+            "localhost".to_string(),
+            8081,
+            crate::models::Resources {
+                cpu_millis: 4000,
+                memory_mb: 8192,
+            },
+        );
+        store.register_node(node);
+
+        let resources = crate::models::Resources {
+            cpu_millis: 1000,
+            memory_mb: 2048,
+        };
+
+        let node = store.get_node("worker-1").unwrap();
+        assert!(node.can_fit(&resources));
+
+        store.allocate_resources_on_node("worker-1", &resources);
+        let node = store.get_node("worker-1").unwrap();
+        assert_eq!(node.used.cpu_millis, 1000);
+        assert_eq!(node.used.memory_mb, 2048);
+
+        let large_resources = crate::models::Resources {
+            cpu_millis: 4000,
+            memory_mb: 8192,
+        };
+
+        // After allocation, should not fit large resources
+        assert!(!node.can_fit(&large_resources));
+
+        store.deallocate_resources_on_node("worker-1", &resources);
+        let node = store.get_node("worker-1").unwrap();
+        assert_eq!(node.used.cpu_millis, 0);
+        assert_eq!(node.used.memory_mb, 0);
     }
 }

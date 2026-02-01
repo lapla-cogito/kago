@@ -46,6 +46,7 @@ jobs:
               env:
                   KAGO_BIN: ./target/release/kago
                   KAGO_PORT: 18080
+                  KAGO_AGENT_PORT: 18081
     fmt:
         name: Format
         runs-on: ubuntu-latest

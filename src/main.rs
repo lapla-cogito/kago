@@ -1,3 +1,4 @@
+mod agent;
 mod api;
 mod cli;
 mod controller;
@@ -7,6 +8,7 @@ mod runtime;
 mod store;
 
 const DEFAULT_PORT: u16 = 8080;
+const DEFAULT_AGENT_PORT: u16 = 8081;
 const DEFAULT_SERVER_URL: &str = "http://localhost:8080";
 
 #[derive(clap::Parser)]
@@ -19,21 +21,43 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Start the control plane server
     Serve {
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
     },
+    /// Start the agent on a worker node
+    Agent {
+        #[arg(short, long)]
+        name: String,
+        #[arg(short, long, default_value = DEFAULT_SERVER_URL)]
+        master: String,
+        #[arg(short, long, default_value_t = DEFAULT_AGENT_PORT)]
+        port: u16,
+        /// Address to advertise to the master (defaults to hostname)
+        #[arg(short, long)]
+        address: Option<String>,
+        /// CPU capacity in millicores (default: 4000 = 4 cores)
+        #[arg(long, default_value_t = 4000)]
+        cpu: u32,
+        /// Memory capacity in MB (default: 8192 = 8GB)
+        #[arg(long, default_value_t = 8192)]
+        memory: u32,
+    },
+    /// Apply a configuration from a file
     Apply {
         #[arg(short, long)]
         file: std::path::PathBuf,
         #[arg(short, long, default_value = DEFAULT_SERVER_URL)]
         server: String,
     },
+    /// Get resources
     Get {
         resource: String,
         #[arg(short, long, default_value = DEFAULT_SERVER_URL)]
         server: String,
     },
+    /// Delete a resource
     Delete {
         resource: String,
         #[arg(short, long, default_value = DEFAULT_SERVER_URL)]
@@ -51,6 +75,20 @@ fn main() {
                 .build()
                 .unwrap()
                 .block_on(run_server(port));
+        }
+        Some(Commands::Agent {
+            name,
+            master,
+            port,
+            address,
+            cpu,
+            memory,
+        }) => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_agent(name, master, port, address, cpu, memory));
         }
         Some(Commands::Apply { file, server }) => {
             if let Err(e) = run_apply(&file, &server) {
@@ -88,21 +126,11 @@ async fn run_server(port: u16) {
         )
         .init();
 
-    tracing::info!("Starting Kago");
-
-    let runtime = match crate::runtime::ContainerRuntime::new().await {
-        Ok(runtime) => std::sync::Arc::new(runtime),
-        Err(e) => {
-            tracing::error!("Failed to initialize container runtime: {}", e);
-            tracing::error!("Make sure Docker or nerdctl is installed and running.");
-            std::process::exit(1);
-        }
-    };
+    tracing::info!("Starting Kago Control Plane");
 
     let store = crate::store::new_shared_store();
     let controller = std::sync::Arc::new(crate::controller::Controller::new(
         std::sync::Arc::clone(&store),
-        runtime,
     ));
     let app = crate::api::create_router(store, std::sync::Arc::clone(&controller));
 
@@ -129,6 +157,89 @@ async fn run_server(port: u16) {
     tracing::info!("Shutting down...");
     controller_handle.abort();
     tracing::info!("Kago stopped");
+}
+
+async fn run_agent(
+    name: String,
+    master: String,
+    port: u16,
+    address: Option<String>,
+    cpu: u32,
+    memory: u32,
+) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "kago=info,tower_http=debug".into()),
+        )
+        .init();
+
+    tracing::info!("Starting Kago Agent: {}", name);
+
+    let runtime = match crate::runtime::ContainerRuntime::new().await {
+        Ok(runtime) => std::sync::Arc::new(runtime),
+        Err(e) => {
+            tracing::error!("Failed to initialize container runtime: {}", e);
+            tracing::error!("Make sure Docker or nerdctl is installed and running.");
+            std::process::exit(1);
+        }
+    };
+
+    let capacity = crate::models::Resources {
+        cpu_millis: cpu,
+        memory_mb: memory,
+    };
+
+    let agent = crate::agent::Agent::new(name.clone(), master, runtime, port, capacity);
+
+    // Determine the address to advertise
+    let advertise_address = address.unwrap_or_else(|| {
+        // Try to get the hostname, fallback to localhost
+        hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "localhost".to_string())
+    });
+
+    // Register with master
+    loop {
+        match agent.register(&advertise_address).await {
+            Ok(_) => break,
+            Err(e) => {
+                tracing::error!("Failed to register with master: {}", e);
+                tracing::info!("Retrying in 5 seconds...");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    // Start heartbeat loop in background
+    let agent_state = agent.state();
+    let heartbeat_handle = tokio::spawn(async move {
+        agent.run_heartbeat_loop().await;
+    });
+
+    // Start agent API server
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!("Agent API server listening on http://{}", addr);
+
+    let app = crate::agent::Agent::create_router(agent_state);
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("Failed to bind to {}: {}", addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("Agent server error");
+
+    tracing::info!("Shutting down agent...");
+    heartbeat_handle.abort();
+    tracing::info!("Agent {} stopped", name);
 }
 
 fn run_apply(file: &std::path::Path, server: &str) -> crate::error::CliResult<()> {
@@ -169,9 +280,11 @@ fn run_get(resource: &str, server: &str) -> crate::error::CliResult<()> {
 
         "pods" | "pod" => client.get_pods()?,
 
+        "nodes" | "node" => client.get_nodes()?,
+
         _ => {
             return Err(crate::error::CliError::HttpError(format!(
-                "Unknown resource type: {} (available: deployments, pods)",
+                "Unknown resource type: {} (available: deployments, pods, nodes)",
                 resource
             )));
         }

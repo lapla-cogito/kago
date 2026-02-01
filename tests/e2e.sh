@@ -9,8 +9,10 @@ NC='\033[0m' # No Color
 
 KAGO_BIN="${KAGO_BIN:-./target/release/kago}"
 KAGO_PORT="${KAGO_PORT:-18080}"
+KAGO_AGENT_PORT="${KAGO_AGENT_PORT:-18081}"
 KAGO_SERVER="http://localhost:${KAGO_PORT}"
 KAGO_PID=""
+AGENT_PID=""
 
 TESTS_PASSED=0
 TESTS_FAILED=0
@@ -34,6 +36,13 @@ log_test() {
 cleanup() {
     log_info "Cleaning up..."
 
+    # Stop agent if running
+    if [[ -n "${AGENT_PID}" ]] && kill -0 "${AGENT_PID}" 2>/dev/null; then
+        log_info "Stopping kago agent (PID: ${AGENT_PID})..."
+        kill "${AGENT_PID}" 2>/dev/null || true
+        wait "${AGENT_PID}" 2>/dev/null || true
+    fi
+
     # Stop kago server if running
     if [[ -n "${KAGO_PID}" ]] && kill -0 "${KAGO_PID}" 2>/dev/null; then
         log_info "Stopping kago server (PID: ${KAGO_PID})..."
@@ -43,7 +52,10 @@ cleanup() {
 
     # Clean up any containers created by kago
     log_info "Cleaning up kago containers..."
-    docker ps -a --filter "name=kago-" --format "{{.ID}}" | xargs -r docker rm -f 2>/dev/null || true
+    docker ps -a --filter "name=test-nginx" --format "{{.ID}}" | xargs -r docker rm -f 2>/dev/null || true
+    docker ps -a --filter "name=yaml-test" --format "{{.ID}}" | xargs -r docker rm -f 2>/dev/null || true
+    docker ps -a --filter "name=multi-web" --format "{{.ID}}" | xargs -r docker rm -f 2>/dev/null || true
+    docker ps -a --filter "name=multi-api" --format "{{.ID}}" | xargs -r docker rm -f 2>/dev/null || true
 
     log_info "Cleanup complete"
 }
@@ -66,6 +78,30 @@ wait_for_server() {
     done
 
     log_error "Server failed to start within ${max_attempts} seconds"
+    return 1
+}
+
+wait_for_agent() {
+    local max_attempts=30
+    local attempt=1
+
+    log_info "Waiting for agent to register..."
+
+    while [[ ${attempt} -le ${max_attempts} ]]; do
+        local nodes
+        nodes=$(curl -s "${KAGO_SERVER}/nodes" 2>/dev/null || echo "[]")
+        local node_count
+        node_count=$(echo "${nodes}" | jq 'length' 2>/dev/null || echo "0")
+
+        if [[ "${node_count}" -ge 1 ]]; then
+            log_info "Agent registered! Node count: ${node_count}"
+            return 0
+        fi
+        sleep 1
+        ((attempt++))
+    done
+
+    log_error "Agent failed to register within ${max_attempts} seconds"
     return 1
 }
 
@@ -143,6 +179,49 @@ test_health_endpoint() {
     assert_contains "${response}" "healthy" "Health endpoint should return healthy status"
 }
 
+test_list_nodes() {
+    local response
+    local http_code
+
+    http_code=$(curl -s -o /tmp/nodes_response.json -w "%{http_code}" \
+        "${KAGO_SERVER}/nodes")
+
+    response=$(cat /tmp/nodes_response.json)
+
+    assert_eq "200" "${http_code}" "Should return 200 OK" || return 1
+
+    local node_count
+    node_count=$(echo "${response}" | jq 'length')
+
+    if [[ "${node_count}" -lt 1 ]]; then
+        log_error "Expected at least 1 node, got ${node_count}"
+        return 1
+    fi
+
+    # Check node is ready
+    local ready_count
+    ready_count=$(echo "${response}" | jq '[.[] | select(.status == "ready")] | length')
+
+    if [[ "${ready_count}" -lt 1 ]]; then
+        log_error "Expected at least 1 ready node"
+        return 1
+    fi
+
+    return 0
+}
+
+test_cli_get_nodes() {
+    local output
+    output=$("${KAGO_BIN}" get nodes --server "${KAGO_SERVER}" 2>&1) || {
+        log_error "kago get nodes failed: ${output}"
+        return 1
+    }
+
+    assert_contains "${output}" "e2e-worker" "Should list e2e-worker node" || return 1
+
+    return 0
+}
+
 test_create_deployment_via_api() {
     local response
     local http_code
@@ -205,11 +284,11 @@ test_list_deployments() {
     return 0
 }
 
-test_pods_created_by_reconciliation() {
+test_pods_created_and_scheduled() {
     local max_attempts=30
     local attempt=1
 
-    log_info "Waiting for reconciliation to create pods..."
+    log_info "Waiting for pods to be created and scheduled to node..."
 
     while [[ ${attempt} -le ${max_attempts} ]]; do
         local response
@@ -219,15 +298,23 @@ test_pods_created_by_reconciliation() {
         pod_count=$(echo "${response}" | jq '[.[] | select(.deployment_name == "test-nginx")] | length')
 
         if [[ "${pod_count}" -ge 1 ]]; then
-            log_info "Found ${pod_count} pod(s) for test-nginx deployment"
-            return 0
+            # Check that pod is assigned to a node
+            local assigned_count
+            assigned_count=$(echo "${response}" | jq '[.[] | select(.deployment_name == "test-nginx" and .node_name != null)] | length')
+
+            if [[ "${assigned_count}" -ge 1 ]]; then
+                local node_name
+                node_name=$(echo "${response}" | jq -r '[.[] | select(.deployment_name == "test-nginx")][0].node_name')
+                log_info "Found ${pod_count} pod(s), assigned to node: ${node_name}"
+                return 0
+            fi
         fi
 
         sleep 2
         ((attempt++))
     done
 
-    log_error "No pods created within ${max_attempts} attempts"
+    log_error "No pods created/scheduled within ${max_attempts} attempts"
     return 1
 }
 
@@ -283,7 +370,7 @@ test_scale_deployment() {
         response=$(curl -s "${KAGO_SERVER}/pods")
 
         local pod_count
-        pod_count=$(echo "${response}" | jq '[.[] | select(.deployment_name == "test-nginx")] | length')
+        pod_count=$(echo "${response}" | jq '[.[] | select(.deployment_name == "test-nginx" and .status != "terminated" and .status != "failed")] | length')
 
         if [[ "${pod_count}" -ge 2 ]]; then
             log_info "Scale-up complete: ${pod_count} pods"
@@ -460,7 +547,7 @@ EOF
 }
 
 main() {
-    log_info "Starting Kago E2E Tests"
+    log_info "Starting Kago E2E Tests (Multi-Node Mode)"
     log_info "================================"
 
     if [[ ! -x "${KAGO_BIN}" ]]; then
@@ -476,13 +563,13 @@ main() {
         fi
     done
 
-
     if ! docker info &> /dev/null; then
         log_error "Docker daemon is not running"
         exit 1
     fi
 
-    log_info "Starting kago server on port ${KAGO_PORT}..."
+    # Start master (control plane)
+    log_info "Starting kago master on port ${KAGO_PORT}..."
     "${KAGO_BIN}" serve --port "${KAGO_PORT}" &
     KAGO_PID=$!
 
@@ -491,15 +578,33 @@ main() {
         exit 1
     fi
 
+    # Start agent (worker node)
+    log_info "Starting kago agent on port ${KAGO_AGENT_PORT}..."
+    "${KAGO_BIN}" agent \
+        --name "e2e-worker" \
+        --master "${KAGO_SERVER}" \
+        --port "${KAGO_AGENT_PORT}" \
+        --address "localhost" \
+        --cpu 4000 \
+        --memory 8192 &
+    AGENT_PID=$!
+
+    if ! wait_for_agent; then
+        log_error "Failed to register agent"
+        exit 1
+    fi
+
     log_info ""
     log_info "Running tests..."
     log_info "================================"
 
     run_test "Health endpoint" test_health_endpoint || true
+    run_test "List nodes" test_list_nodes || true
+    run_test "CLI get nodes" test_cli_get_nodes || true
     run_test "Create deployment via API" test_create_deployment_via_api || true
     run_test "Get deployment" test_get_deployment || true
     run_test "List deployments" test_list_deployments || true
-    run_test "Pods created by reconciliation" test_pods_created_by_reconciliation || true
+    run_test "Pods created and scheduled" test_pods_created_and_scheduled || true
     run_test "Container running" test_container_running || true
     run_test "Scale deployment" test_scale_deployment || true
     run_test "Apply YAML manifest" test_apply_yaml_manifest || true
