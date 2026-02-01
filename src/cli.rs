@@ -159,9 +159,120 @@ pub fn parse_manifests(yaml: &str) -> crate::error::CliResult<Vec<DeploymentMani
 pub fn parse_manifests_from_file(
     path: &std::path::Path,
 ) -> crate::error::CliResult<Vec<DeploymentManifest>> {
-    let content = std::fs::read_to_string(path)?;
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    parse_manifests(&content)
+    match extension {
+        "jsonnet" => parse_manifests_from_jsonnet(path),
+        _ => {
+            let content = std::fs::read_to_string(path)?;
+            parse_manifests(&content)
+        }
+    }
+}
+
+fn val_to_serde_value(val: &jrsonnet_evaluator::Val) -> Result<serde_json::Value, String> {
+    match val {
+        jrsonnet_evaluator::Val::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        jrsonnet_evaluator::Val::Null => Ok(serde_json::Value::Null),
+        jrsonnet_evaluator::Val::Str(s) => Ok(serde_json::Value::String(s.to_string())),
+        jrsonnet_evaluator::Val::Num(n) => {
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                Ok(serde_json::Value::Number((*n as i64).into()))
+            } else {
+                serde_json::Number::from_f64(*n)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| format!("Invalid number: {}", n))
+            }
+        }
+        jrsonnet_evaluator::Val::Arr(arr) => {
+            let items: Result<Vec<_>, _> = arr
+                .iter()
+                .map(|item| {
+                    item.map_err(|e| format!("Array item error: {:?}", e))
+                        .and_then(|v| val_to_serde_value(&v))
+                })
+                .collect();
+            Ok(serde_json::Value::Array(items?))
+        }
+        jrsonnet_evaluator::Val::Obj(obj) => {
+            let mut map = serde_json::Map::new();
+            for field in obj.fields() {
+                let value = obj
+                    .get(field.clone())
+                    .map_err(|e| format!("Field error: {:?}", e))?
+                    .ok_or_else(|| format!("Field {} not found", field))?;
+                map.insert(field.to_string(), val_to_serde_value(&value)?);
+            }
+            Ok(serde_json::Value::Object(map))
+        }
+        jrsonnet_evaluator::Val::Func(_) => {
+            Err("Functions cannot be converted to JSON".to_string())
+        }
+    }
+}
+
+pub fn parse_manifests_from_jsonnet(
+    path: &std::path::Path,
+) -> crate::error::CliResult<Vec<DeploymentManifest>> {
+    let state = jrsonnet_evaluator::EvaluationState::default();
+    state.with_stdlib();
+
+    let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    let parent_dir = abs_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+
+    let resolver = jrsonnet_evaluator::FileImportResolver {
+        library_paths: vec![parent_dir],
+    };
+    state.set_import_resolver(Box::new(resolver));
+
+    let rc_path: std::rc::Rc<std::path::Path> = std::rc::Rc::from(abs_path.as_path());
+
+    let result: Result<Vec<DeploymentManifest>, crate::error::CliError> =
+        state.run_in_state(|| {
+            let val = state
+                .evaluate_file_raw(&rc_path)
+                .map_err(|e| crate::error::CliError::JsonnetError(state.stringify_err(&e)))?;
+            let json_value =
+                val_to_serde_value(&val).map_err(crate::error::CliError::JsonnetError)?;
+            let manifests = match json_value {
+                serde_json::Value::Array(arr) => {
+                    let mut result = Vec::new();
+                    for item in arr {
+                        let manifest: DeploymentManifest =
+                            serde_json::from_value(item).map_err(|e| {
+                                crate::error::CliError::JsonnetError(format!(
+                                    "Invalid manifest: {}",
+                                    e
+                                ))
+                            })?;
+                        manifest.validate()?;
+                        result.push(manifest);
+                    }
+                    result
+                }
+                serde_json::Value::Object(_) => {
+                    let manifest: DeploymentManifest =
+                        serde_json::from_value(json_value).map_err(|e| {
+                            crate::error::CliError::JsonnetError(format!("Invalid manifest: {}", e))
+                        })?;
+                    manifest.validate()?;
+                    vec![manifest]
+                }
+                _ => {
+                    return Err(crate::error::CliError::JsonnetError(
+                        "Jsonnet must evaluate to an object or array of objects".to_string(),
+                    ));
+                }
+            };
+
+            Ok(manifests)
+        });
+
+    result
 }
 
 pub struct CliClient {
@@ -403,5 +514,66 @@ spec:
 
         let result = DeploymentManifest::from_yaml(yaml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_jsonnet_single_deployment() {
+        let manifests =
+            parse_manifests_from_jsonnet(std::path::Path::new("examples/nginx-deployment.jsonnet"))
+                .unwrap();
+
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].spec.name, "nginx");
+        assert_eq!(manifests[0].spec.image, "nginx:alpine");
+        assert_eq!(manifests[0].spec.replicas, 3);
+
+        let request = manifests[0].to_create_request();
+        assert_eq!(request.resources.cpu_millis, 100);
+        assert_eq!(request.resources.memory_mb, 128);
+    }
+
+    #[test]
+    fn test_parse_jsonnet_multi_deployment() {
+        let manifests =
+            parse_manifests_from_jsonnet(std::path::Path::new("examples/multi-deployment.jsonnet"))
+                .unwrap();
+
+        assert_eq!(manifests.len(), 3);
+
+        assert_eq!(manifests[0].spec.name, "web");
+        assert_eq!(manifests[0].spec.image, "nginx:alpine");
+        assert_eq!(manifests[0].spec.replicas, 2);
+        let request = manifests[0].to_create_request();
+        assert_eq!(request.resources.cpu_millis, 100);
+        assert_eq!(request.resources.memory_mb, 128);
+
+        assert_eq!(manifests[1].spec.name, "api");
+        assert_eq!(manifests[1].spec.image, "httpd:alpine");
+        assert_eq!(manifests[1].spec.replicas, 2);
+        let request = manifests[1].to_create_request();
+        assert_eq!(request.resources.cpu_millis, 200);
+        assert_eq!(request.resources.memory_mb, 256);
+
+        assert_eq!(manifests[2].spec.name, "cache");
+        assert_eq!(manifests[2].spec.image, "redis:alpine");
+        assert_eq!(manifests[2].spec.replicas, 1);
+        let request = manifests[2].to_create_request();
+        assert_eq!(request.resources.cpu_millis, 150);
+        assert_eq!(request.resources.memory_mb, 512);
+    }
+
+    #[test]
+    fn test_parse_manifests_from_file_detects_extension() {
+        let yaml_manifests =
+            parse_manifests_from_file(std::path::Path::new("examples/nginx-deployment.yml"))
+                .unwrap();
+        assert_eq!(yaml_manifests.len(), 1);
+        assert_eq!(yaml_manifests[0].spec.name, "nginx");
+
+        let jsonnet_manifests =
+            parse_manifests_from_file(std::path::Path::new("examples/nginx-deployment.jsonnet"))
+                .unwrap();
+        assert_eq!(jsonnet_manifests.len(), 1);
+        assert_eq!(jsonnet_manifests[0].spec.name, "nginx");
     }
 }
