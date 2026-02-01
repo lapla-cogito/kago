@@ -199,7 +199,7 @@ impl Agent {
                         pod.status = new_status;
                     }
                 }
-                Err(crate::runtime::RuntimeError::ContainerNotFound(_)) => {
+                Err(crate::error::RuntimeError::ContainerNotFound(_)) => {
                     let mut pods = self.state.pods.write().await;
                     if let Some(pod) = pods.get_mut(&pod_id)
                         && !matches!(
@@ -374,7 +374,7 @@ async fn delete_pod(
     if let Some(container_id) = container_id {
         if let Err(e) = state.runtime.stop_container(&container_id).await {
             match e {
-                crate::runtime::RuntimeError::ContainerNotFound(_) => {}
+                crate::error::RuntimeError::ContainerNotFound(_) => {}
                 _ => {
                     tracing::warn!("Failed to stop container {}: {}", name, e);
                 }

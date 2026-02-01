@@ -177,11 +177,14 @@ impl Store {
     }
 
     pub fn get_ready_nodes(&self) -> Vec<crate::models::Node> {
-        self.nodes
+        let mut nodes: Vec<_> = self
+            .nodes
             .values()
             .filter(|n| n.status == crate::models::NodeStatus::Ready)
             .cloned()
-            .collect()
+            .collect();
+        nodes.sort_by(|a, b| a.name.cmp(&b.name));
+        nodes
     }
 
     pub fn allocate_resources_on_node(

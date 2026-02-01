@@ -1,5 +1,3 @@
-pub use crate::error::{RuntimeError, RuntimeResult};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerStatus {
     Created,
@@ -30,7 +28,7 @@ pub struct ContainerRuntime {
 }
 
 impl ContainerRuntime {
-    pub async fn new() -> RuntimeResult<Self> {
+    pub async fn new() -> crate::error::RuntimeResult<Self> {
         let docker = bollard::Docker::connect_with_local_defaults()?;
 
         docker.ping().await?;
@@ -45,7 +43,7 @@ impl ContainerRuntime {
         image: &str,
         cpu_millis: Option<u32>,
         memory_mb: Option<u32>,
-    ) -> RuntimeResult<String> {
+    ) -> crate::error::RuntimeResult<String> {
         self.ensure_image(image).await?;
 
         let host_config = bollard::models::HostConfig {
@@ -82,7 +80,7 @@ impl ContainerRuntime {
         Ok(container_id)
     }
 
-    pub async fn stop_container(&self, name_or_id: &str) -> RuntimeResult<()> {
+    pub async fn stop_container(&self, name_or_id: &str) -> crate::error::RuntimeResult<()> {
         tracing::info!("Stopping container: {}", name_or_id);
 
         let options = bollard::query_parameters::StopContainerOptions {
@@ -99,7 +97,9 @@ impl ContainerRuntime {
                 status_code: 404, ..
             }) => {
                 tracing::warn!("Container {} not found", name_or_id);
-                Err(RuntimeError::ContainerNotFound(name_or_id.to_string()))
+                Err(crate::error::RuntimeError::ContainerNotFound(
+                    name_or_id.to_string(),
+                ))
             }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 304, ..
@@ -107,11 +107,11 @@ impl ContainerRuntime {
                 tracing::debug!("Container {} already stopped", name_or_id);
                 Ok(())
             }
-            Err(e) => Err(RuntimeError::Docker(e)),
+            Err(e) => Err(crate::error::RuntimeError::Docker(e)),
         }
     }
 
-    pub async fn remove_container(&self, name_or_id: &str) -> RuntimeResult<()> {
+    pub async fn remove_container(&self, name_or_id: &str) -> crate::error::RuntimeResult<()> {
         tracing::info!("Removing container: {}", name_or_id);
 
         let options = bollard::query_parameters::RemoveContainerOptions {
@@ -134,11 +134,14 @@ impl ContainerRuntime {
                 tracing::warn!("Container {} was already removed", name_or_id);
                 Ok(())
             }
-            Err(e) => Err(RuntimeError::Docker(e)),
+            Err(e) => Err(crate::error::RuntimeError::Docker(e)),
         }
     }
 
-    pub async fn get_container_state(&self, name_or_id: &str) -> RuntimeResult<ContainerStatus> {
+    pub async fn get_container_state(
+        &self,
+        name_or_id: &str,
+    ) -> crate::error::RuntimeResult<ContainerStatus> {
         match self.docker.inspect_container(name_or_id, None).await {
             Ok(info) => {
                 let status = info
@@ -151,12 +154,14 @@ impl ContainerRuntime {
             }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
-            }) => Err(RuntimeError::ContainerNotFound(name_or_id.to_string())),
-            Err(e) => Err(RuntimeError::Docker(e)),
+            }) => Err(crate::error::RuntimeError::ContainerNotFound(
+                name_or_id.to_string(),
+            )),
+            Err(e) => Err(crate::error::RuntimeError::Docker(e)),
         }
     }
 
-    async fn ensure_image(&self, image: &str) -> RuntimeResult<()> {
+    async fn ensure_image(&self, image: &str) -> crate::error::RuntimeResult<()> {
         match self.docker.inspect_image(image).await {
             Ok(_) => {
                 tracing::debug!("Image {} already exists", image);
@@ -167,7 +172,7 @@ impl ContainerRuntime {
             }) => {
                 tracing::info!("Image {} not found locally, pulling...", image);
             }
-            Err(e) => return Err(RuntimeError::Docker(e)),
+            Err(e) => return Err(crate::error::RuntimeError::Docker(e)),
         }
 
         let options = bollard::query_parameters::CreateImageOptions {
@@ -177,15 +182,14 @@ impl ContainerRuntime {
 
         let mut stream = self.docker.create_image(Some(options), None, None);
 
-        use futures_util::StreamExt as _;
-        while let Some(result) = stream.next().await {
+        while let Some(result) = futures_util::StreamExt::next(&mut stream).await {
             match result {
                 Ok(info) => {
                     if let Some(status) = info.status {
                         tracing::debug!("Pull {}: {}", image, status);
                     }
                 }
-                Err(e) => return Err(RuntimeError::Docker(e)),
+                Err(e) => return Err(crate::error::RuntimeError::Docker(e)),
             }
         }
 

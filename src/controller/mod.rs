@@ -1,10 +1,13 @@
 mod scheduler;
 
+pub use scheduler::SchedulingStrategy;
+
 pub struct Controller {
     store: crate::store::SharedStore,
     reconcile_interval: std::time::Duration,
     node_timeout: std::time::Duration,
     http_client: reqwest::Client,
+    scheduling_strategy: scheduler::SchedulingStrategy,
 }
 
 impl Controller {
@@ -17,13 +20,20 @@ impl Controller {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap(),
+            scheduling_strategy: scheduler::SchedulingStrategy::default(),
         }
+    }
+
+    pub fn with_scheduling_strategy(mut self, strategy: scheduler::SchedulingStrategy) -> Self {
+        self.scheduling_strategy = strategy;
+        self
     }
 
     pub async fn run(&self) {
         tracing::info!(
-            "Starting controller with reconcile interval: {:?}",
-            self.reconcile_interval
+            "Starting controller with reconcile interval: {:?}, scheduling strategy: {:?}",
+            self.reconcile_interval,
+            self.scheduling_strategy
         );
 
         let mut ticker = tokio::time::interval(self.reconcile_interval);
@@ -51,6 +61,7 @@ impl Controller {
         }
 
         scheduler::Scheduler::new(self)
+            .with_strategy(self.scheduling_strategy)
             .schedule_pending_pods()
             .await;
         self.cleanup_terminated_pods().await;
@@ -178,7 +189,7 @@ impl Controller {
         crate::models::Pod::from_deployment(deployment, final_index)
     }
 
-    async fn terminate_pod(&self, pod_id: uuid::Uuid) {
+    pub async fn terminate_pod(&self, pod_id: uuid::Uuid) {
         let (name, node_name, resources) = {
             let store = self.store.read().await;
             match store.get_pod(&pod_id) {
@@ -188,6 +199,8 @@ impl Controller {
         };
 
         tracing::info!("Terminating pod: {}", name);
+
+        let mut node_deletion_succeeded = node_name.is_none();
 
         {
             let mut store = self.store.write().await;
@@ -207,6 +220,7 @@ impl Controller {
                     Ok(response) => {
                         if response.status().is_success() {
                             tracing::info!("Pod {} deleted from node {}", name, node_name);
+                            node_deletion_succeeded = true;
                         } else {
                             tracing::warn!(
                                 "Failed to delete pod {} from node {}: {}",
@@ -226,17 +240,30 @@ impl Controller {
                     }
                 }
 
-                let mut store = self.store.write().await;
-                store.deallocate_resources_on_node(node_name, &resources);
+                if node_deletion_succeeded {
+                    let mut store = self.store.write().await;
+                    store.deallocate_resources_on_node(node_name, &resources);
+                }
             }
         }
 
         {
             let mut store = self.store.write().await;
-            store.update_pod_status(&pod_id, crate::models::PodStatus::Terminated);
+            if node_deletion_succeeded {
+                store.update_pod_status(&pod_id, crate::models::PodStatus::Terminated);
+            } else {
+                store.update_pod_status(&pod_id, crate::models::PodStatus::Running);
+            }
         }
 
-        tracing::info!("Pod {} terminated", name);
+        if node_deletion_succeeded {
+            tracing::info!("Pod {} terminated", name);
+        } else {
+            tracing::warn!(
+                "Failed to terminate pod {}; status reverted to Running",
+                name
+            );
+        }
     }
 
     async fn cleanup_terminated_pods(&self) {
