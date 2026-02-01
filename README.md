@@ -244,7 +244,7 @@ cargo test
 ./tests/e2e.sh --scheduler least-allocated --multi-node
 
 # Test all scheduler strategies
-./tests/test-all-schedulers.sh
+./tests/test-schedulers.sh
 ```
 
 ## License

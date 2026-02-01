@@ -1066,7 +1066,6 @@ dependencies = [
  "futures-util",
  "hostname",
  "jrsonnet-evaluator",
- "jrsonnet-parser",
  "reqwest",
  "serde",
  "serde_json",
