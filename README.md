@@ -30,6 +30,8 @@ Options:
 
 ### 3. Deploy an Application
 
+#### Using YAML
+
 Create a deployment manifest (see `examples/nginx-deployment.yml`):
 
 ```yaml
@@ -65,10 +67,53 @@ spec:
     memory: 256Mi
 ```
 
+#### Using Jsonnet
+
+Kago also supports [Jsonnet](https://jsonnet.org/) for more powerful configuration with variables, functions, and imports (see `examples/nginx-deployment.jsonnet`):
+
+```jsonnet
+{
+  kind: "Deployment",
+  spec: {
+    name: "nginx",
+    image: "nginx:alpine",
+    replicas: 3,
+    resources: {
+      cpu: "100m",
+      memory: "128Mi",
+    },
+  },
+}
+```
+
+You can use Jsonnet's features like helper functions to reduce repetition (see `examples/multi-deployment.jsonnet`):
+
+```jsonnet
+local deployment(name, image, replicas=1, cpu="100m", memory="128Mi") = {
+  kind: "Deployment",
+  spec: {
+    name: name,
+    image: image,
+    replicas: replicas,
+    resources: { cpu: cpu, memory: memory },
+  },
+};
+
+[
+  deployment("web", "nginx:alpine", 2),
+  deployment("api", "httpd:alpine", 2, "200m", "256Mi"),
+  deployment("cache", "redis:alpine", 1, "150m", "512Mi"),
+]
+```
+
+#### Applying Manifests
+
 Apply it:
 
 ```bash
 kago apply -f examples/nginx-deployment.yml
+# or with Jsonnet
+kago apply -f examples/nginx-deployment.jsonnet
 ```
 
 ### 4. Check Status
@@ -112,6 +157,9 @@ kago agent --name worker-1 \
 ```bash
 # Apply deployment(s) from YAML file
 kago apply -f deployment.yml
+
+# Apply deployment(s) from Jsonnet file
+kago apply -f deployment.jsonnet
 
 # Get resources
 kago get deployments

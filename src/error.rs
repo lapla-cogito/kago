@@ -18,6 +18,8 @@ pub enum CliError {
     YamlError(#[from] serde_yaml::Error),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("Jsonnet error: {0}")]
+    JsonnetError(String),
 }
 
 pub type CliResult<T> = std::result::Result<T, CliError>;

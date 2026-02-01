@@ -413,6 +413,99 @@ EOF
     return 0
 }
 
+test_apply_jsonnet_manifest() {
+    local manifest_file="/tmp/test-deployment.jsonnet"
+
+    cat > "${manifest_file}" << EOF
+{
+  kind: "Deployment",
+  spec: {
+    name: "${TEST_CONTAINER_PREFIX}jsonnet",
+    image: "alpine:latest",
+    replicas: 1,
+    resources: {
+      cpu: "50m",
+      memory: "64Mi",
+    },
+  },
+}
+EOF
+
+    local output
+    output=$("${KAGO_BIN}" apply -f "${manifest_file}" --server "${KAGO_SERVER}" 2>&1) || {
+        log_error "kago apply jsonnet failed: ${output}"
+        return 1
+    }
+
+    log_info "Apply jsonnet output: ${output}"
+
+    local response
+    response=$(curl -s "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}jsonnet")
+
+    assert_json_field "${response}" ".name" "${TEST_CONTAINER_PREFIX}jsonnet" "Jsonnet deployment should be created" || return 1
+
+    "${KAGO_BIN}" delete "${TEST_CONTAINER_PREFIX}jsonnet" --server "${KAGO_SERVER}" > /dev/null 2>&1 || true
+
+    return 0
+}
+
+test_multi_deployment_jsonnet_manifest() {
+    local manifest_file="/tmp/multi-deployment.jsonnet"
+
+    cat > "${manifest_file}" << 'JSONNET_EOF'
+local deployment(name, image, replicas=1, cpu="50m", memory="64Mi") = {
+  kind: "Deployment",
+  spec: {
+    name: name,
+    image: image,
+    replicas: replicas,
+    resources: {
+      cpu: cpu,
+      memory: memory,
+    },
+  },
+};
+
+local prefix = "CONTAINER_PREFIX";
+local defaultReplicas = 1;
+
+[
+  deployment(prefix + "jnet-web", "nginx:alpine", defaultReplicas, "100m", "128Mi"),
+  deployment(prefix + "jnet-api", "httpd:alpine", defaultReplicas, "100m", "128Mi"),
+]
+JSONNET_EOF
+
+    sed -i "s/CONTAINER_PREFIX/${TEST_CONTAINER_PREFIX}/g" "${manifest_file}"
+
+    local output
+    output=$("${KAGO_BIN}" apply -f "${manifest_file}" --server "${KAGO_SERVER}" 2>&1) || {
+        log_error "kago apply multi jsonnet failed: ${output}"
+        return 1
+    }
+
+    log_info "Apply multi jsonnet output: ${output}"
+
+    local response
+    response=$(curl -s "${KAGO_SERVER}/deployments")
+
+    local web_exists api_exists
+    web_exists=$(echo "${response}" | jq '[.[] | select(.name == "'"${TEST_CONTAINER_PREFIX}"'jnet-web")] | length')
+    api_exists=$(echo "${response}" | jq '[.[] | select(.name == "'"${TEST_CONTAINER_PREFIX}"'jnet-api")] | length')
+
+    if [[ "${web_exists}" -ne 1 ]] || [[ "${api_exists}" -ne 1 ]]; then
+        log_error "Expected both ${TEST_CONTAINER_PREFIX}jnet-web and ${TEST_CONTAINER_PREFIX}jnet-api deployments"
+        log_error "web_exists=${web_exists}, api_exists=${api_exists}"
+        return 1
+    fi
+
+    log_info "Both jsonnet deployments created successfully"
+
+    "${KAGO_BIN}" delete "${TEST_CONTAINER_PREFIX}jnet-web" --server "${KAGO_SERVER}" > /dev/null 2>&1 || true
+    "${KAGO_BIN}" delete "${TEST_CONTAINER_PREFIX}jnet-api" --server "${KAGO_SERVER}" > /dev/null 2>&1 || true
+
+    return 0
+}
+
 test_cli_get_deployments() {
     local output
     output=$("${KAGO_BIN}" get deployments --server "${KAGO_SERVER}" 2>&1) || {
@@ -1042,6 +1135,8 @@ main() {
     run_test "Container running" test_container_running || true
     run_test "Scale deployment" test_scale_deployment || true
     run_test "Apply YAML manifest" test_apply_yaml_manifest || true
+    run_test "Apply Jsonnet manifest" test_apply_jsonnet_manifest || true
+    run_test "Multi-deployment Jsonnet manifest" test_multi_deployment_jsonnet_manifest || true
     run_test "CLI get deployments" test_cli_get_deployments || true
     run_test "CLI get pods" test_cli_get_pods || true
     run_test "Multi-deployment manifest" test_multi_deployment_manifest || true
