@@ -1,5 +1,6 @@
 mod deployments;
 mod health;
+mod metrics;
 mod nodes;
 mod pods;
 
@@ -57,6 +58,7 @@ pub fn create_router(
             "/nodes/{name}/heartbeat",
             axum::routing::post(nodes::node_heartbeat),
         )
+        .route("/metrics", axum::routing::get(metrics::metrics_handler))
         .with_state(state)
 }
 
