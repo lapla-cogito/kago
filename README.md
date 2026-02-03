@@ -222,6 +222,23 @@ curl http://localhost:8080/pods
 curl http://localhost:8080/nodes
 ```
 
+## Monitoring
+
+Kago provides Prometheus metrics for monitoring cluster state.
+
+### Quick Start
+
+```bash
+cd monitoring
+docker compose up -d
+
+# Access:
+# - Prometheus: http://localhost:9091
+# - Grafana: http://localhost:3000 (login: admin/admin)
+# - Raw metrics: http://localhost:8080/metrics
+```
+See [`src/metrics.rs`](src/metrics.rs) for available metrics.
+
 ## Running Tests
 
 ### Unit Tests

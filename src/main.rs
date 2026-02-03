@@ -3,6 +3,7 @@ mod api;
 mod cli;
 mod controller;
 mod error;
+mod metrics;
 mod models;
 mod runtime;
 mod store;
