@@ -10,6 +10,12 @@ pub struct Controller {
     scheduling_strategy: scheduler::SchedulingStrategy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollingUpdateStatus {
+    NoUpdate,
+    InProgress,
+}
+
 impl Controller {
     pub fn new(store: crate::store::SharedStore) -> Self {
         Self {
@@ -96,16 +102,15 @@ impl Controller {
         deployment: &crate::models::Deployment,
     ) -> Result<(), String> {
         tracing::debug!(
-            "Reconciling deployment: {} (replicas: {})",
+            "Reconciling deployment: {} (replicas: {}, revision: {})",
             deployment.name,
-            deployment.replicas
+            deployment.replicas,
+            deployment.revision
         );
 
-        let (current_count, deployment_exists) = {
+        let deployment_exists = {
             let store = self.store.read().await;
-            let exists = store.get_deployment(&deployment.name).is_some();
-            let count = store.count_active_pods_for_deployment(&deployment.name);
-            (count, exists)
+            store.get_deployment(&deployment.name).is_some()
         };
 
         if !deployment_exists {
@@ -115,6 +120,40 @@ impl Controller {
             );
             return Ok(());
         }
+
+        let rolling_update_status = self.check_rolling_update_status(deployment).await;
+
+        match rolling_update_status {
+            RollingUpdateStatus::InProgress => {
+                self.reconcile_rolling_update(deployment).await?;
+            }
+            RollingUpdateStatus::NoUpdate => {
+                self.reconcile_normal(deployment).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn check_rolling_update_status(
+        &self,
+        deployment: &crate::models::Deployment,
+    ) -> RollingUpdateStatus {
+        let store = self.store.read().await;
+        let old_pods = store.get_old_revision_pods(&deployment.name, deployment.revision);
+
+        if old_pods.is_empty() {
+            RollingUpdateStatus::NoUpdate
+        } else {
+            RollingUpdateStatus::InProgress
+        }
+    }
+
+    async fn reconcile_normal(&self, deployment: &crate::models::Deployment) -> Result<(), String> {
+        let current_count = {
+            let store = self.store.read().await;
+            store.count_active_pods_for_deployment(&deployment.name)
+        };
 
         let desired_count = deployment.replicas;
 
@@ -156,6 +195,111 @@ impl Controller {
             for pod_id in pod_ids {
                 self.terminate_pod(pod_id).await;
             }
+        }
+
+        Ok(())
+    }
+
+    async fn reconcile_rolling_update(
+        &self,
+        deployment: &crate::models::Deployment,
+    ) -> Result<(), String> {
+        let config = &deployment.rolling_update;
+        let desired = deployment.replicas;
+
+        let (new_running, new_total, old_running, old_total) = {
+            let store = self.store.read().await;
+            let new_running =
+                store.count_running_pods_for_revision(&deployment.name, deployment.revision);
+            let new_total =
+                store.count_active_pods_for_revision(&deployment.name, deployment.revision);
+            let old_pods = store.get_old_revision_pods(&deployment.name, deployment.revision);
+            let old_running = old_pods
+                .iter()
+                .filter(|p| p.status == crate::models::PodStatus::Running)
+                .count() as u32;
+            let old_total = old_pods.len() as u32;
+            (new_running, new_total, old_running, old_total)
+        };
+
+        let total_running = new_running + old_running;
+        let total_pods = new_total + old_total;
+
+        tracing::info!(
+            "Rolling update for {}: new_running={}, new_total={}, old_running={}, old_total={}, desired={}",
+            deployment.name,
+            new_running,
+            new_total,
+            old_running,
+            old_total,
+            desired
+        );
+
+        let max_total = desired + config.max_surge;
+        let can_create = max_total.saturating_sub(total_pods);
+        let new_pods_needed = desired.saturating_sub(new_total);
+        let to_create = can_create.min(new_pods_needed);
+
+        if to_create > 0 {
+            tracing::info!(
+                "Rolling update {}: creating {} new pods (max_surge: {})",
+                deployment.name,
+                to_create,
+                config.max_surge
+            );
+
+            for i in 0..to_create {
+                let pod = self
+                    .create_pod_for_deployment(deployment, new_total + i)
+                    .await;
+                let mut store = self.store.write().await;
+                store.add_pod(pod);
+            }
+        }
+
+        let min_available = desired.saturating_sub(config.max_unavailable);
+
+        // We can terminate old pods if:
+        // - New pods are running and can take over
+        // - Total running pods would still be >= min_available after termination
+        let can_terminate = if total_running > min_available {
+            let excess = total_running - min_available;
+            if new_running > 0 || config.max_unavailable > 0 {
+                excess.min(old_running)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if can_terminate > 0 && old_total > 0 {
+            tracing::info!(
+                "Rolling update {}: terminating {} old pods (max_unavailable: {})",
+                deployment.name,
+                can_terminate,
+                config.max_unavailable
+            );
+
+            let pod_ids = {
+                let store = self.store.read().await;
+                store.get_old_pods_to_terminate(
+                    &deployment.name,
+                    deployment.revision,
+                    can_terminate,
+                )
+            };
+
+            for pod_id in pod_ids {
+                self.terminate_pod(pod_id).await;
+            }
+        }
+
+        if old_total == 0 && new_total >= desired {
+            tracing::info!(
+                "Rolling update completed for deployment {}",
+                deployment.name
+            );
         }
 
         Ok(())
@@ -326,6 +470,8 @@ mod tests {
                     cpu_millis: 100,
                     memory_mb: 128,
                 },
+                rolling_update: crate::models::RollingUpdateConfig::default(),
+                revision: 1,
             };
             s.upsert_deployment(deployment);
         }

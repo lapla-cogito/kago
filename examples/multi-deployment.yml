@@ -6,6 +6,9 @@ spec:
     resources:
         cpu: 100m
         memory: 128Mi
+    rolling_update:
+        max_surge: 1
+        max_unavailable: 0
 ---
 kind: Deployment
 spec:
@@ -15,6 +18,9 @@ spec:
     resources:
         cpu: 200m
         memory: 256Mi
+    rolling_update:
+        max_surge: 1
+        max_unavailable: 0
 ---
 kind: Deployment
 spec:
@@ -24,3 +30,6 @@ spec:
     resources:
         cpu: 50m
         memory: 64Mi
+    rolling_update:
+        max_surge: 1
+        max_unavailable: 0

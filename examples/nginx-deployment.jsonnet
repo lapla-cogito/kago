@@ -8,5 +8,9 @@
       cpu: "100m",
       memory: "128Mi",
     },
+    rolling_update: {
+      max_surge: 1,
+      max_unavailable: 0,
+    },
   },
 }

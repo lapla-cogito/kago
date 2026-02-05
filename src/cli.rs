@@ -66,6 +66,27 @@ impl MemoryValue {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RollingUpdateSpec {
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u32,
+    #[serde(default)]
+    pub max_unavailable: u32,
+}
+
+fn default_max_surge() -> u32 {
+    1
+}
+
+impl Default for RollingUpdateSpec {
+    fn default() -> Self {
+        Self {
+            max_surge: 1,
+            max_unavailable: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeploymentSpec {
     pub name: String,
     pub image: String,
@@ -73,6 +94,8 @@ pub struct DeploymentSpec {
     pub replicas: u32,
     #[serde(default)]
     pub resources: ResourceSpec,
+    #[serde(default)]
+    pub rolling_update: RollingUpdateSpec,
 }
 
 fn default_replicas() -> u32 {
@@ -129,6 +152,10 @@ impl DeploymentManifest {
                     .as_ref()
                     .map(|m| m.to_megabytes())
                     .unwrap_or(0),
+            },
+            rolling_update: crate::models::RollingUpdateConfig {
+                max_surge: self.spec.rolling_update.max_surge,
+                max_unavailable: self.spec.rolling_update.max_unavailable,
             },
         }
     }
