@@ -1,4 +1,4 @@
-local deployment(name, image, replicas=1, cpu="100m", memory="128Mi") = {
+local deployment(name, image, replicas=1, cpu="100m", memory="128Mi", maxSurge=1, maxUnavailable=0) = {
   kind: "Deployment",
   spec: {
     name: name,
@@ -7,6 +7,10 @@ local deployment(name, image, replicas=1, cpu="100m", memory="128Mi") = {
     resources: {
       cpu: cpu,
       memory: memory,
+    },
+    rolling_update: {
+      max_surge: maxSurge,
+      max_unavailable: maxUnavailable,
     },
   },
 };

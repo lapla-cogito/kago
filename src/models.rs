@@ -4,6 +4,29 @@ pub struct Resources {
     pub memory_mb: u32,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RollingUpdateConfig {
+    /// Maximum number of pods that can be created above the desired replica count
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u32,
+    /// Maximum number of pods that can be unavailable during the update
+    #[serde(default)]
+    pub max_unavailable: u32,
+}
+
+fn default_max_surge() -> u32 {
+    1
+}
+
+impl Default for RollingUpdateConfig {
+    fn default() -> Self {
+        Self {
+            max_surge: 1,
+            max_unavailable: 0,
+        }
+    }
+}
+
 impl Resources {
     pub fn subtract(&self, other: &Resources) -> Resources {
         Resources {
@@ -41,6 +64,9 @@ pub struct Pod {
     pub container_id: Option<String>,
     #[serde(default)]
     pub node_name: Option<String>,
+    /// Revision number for rolling updates (matches deployment's revision when created)
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl Pod {
@@ -54,6 +80,7 @@ impl Pod {
             status: PodStatus::Pending,
             container_id: None,
             node_name: None,
+            revision: deployment.revision,
         }
     }
 }
@@ -64,6 +91,16 @@ pub struct Deployment {
     pub image: String,
     pub replicas: u32,
     pub resources: Resources,
+    /// Rolling update configuration
+    #[serde(default)]
+    pub rolling_update: RollingUpdateConfig,
+    /// Current revision number, incremented on image changes
+    #[serde(default = "default_revision")]
+    pub revision: u64,
+}
+
+fn default_revision() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -74,6 +111,8 @@ pub struct CreateDeploymentRequest {
     pub replicas: u32,
     #[serde(default)]
     pub resources: Resources,
+    #[serde(default)]
+    pub rolling_update: RollingUpdateConfig,
 }
 
 fn default_replicas() -> u32 {
@@ -93,16 +132,27 @@ pub struct DeploymentResponse {
     pub replicas: u32,
     pub resources: Resources,
     pub ready_replicas: u32,
+    pub rolling_update: RollingUpdateConfig,
+    pub revision: u64,
+    /// Number of pods with the current revision
+    pub updated_replicas: u32,
 }
 
 impl DeploymentResponse {
-    pub fn from_deployment(deployment: &Deployment, ready_replicas: u32) -> Self {
+    pub fn from_deployment(
+        deployment: &Deployment,
+        ready_replicas: u32,
+        updated_replicas: u32,
+    ) -> Self {
         Self {
             name: deployment.name.clone(),
             image: deployment.image.clone(),
             replicas: deployment.replicas,
             resources: deployment.resources,
             ready_replicas,
+            rolling_update: deployment.rolling_update,
+            revision: deployment.revision,
+            updated_replicas,
         }
     }
 }
@@ -115,6 +165,7 @@ pub struct PodResponse {
     pub status: PodStatus,
     pub deployment_name: Option<String>,
     pub node_name: Option<String>,
+    pub revision: u64,
 }
 
 impl From<&Pod> for PodResponse {
@@ -126,6 +177,7 @@ impl From<&Pod> for PodResponse {
             status: pod.status,
             deployment_name: pod.deployment_name.clone(),
             node_name: pod.node_name.clone(),
+            revision: pod.revision,
         }
     }
 }

@@ -118,6 +118,83 @@ impl Store {
             .collect()
     }
 
+    pub fn get_old_revision_pods(
+        &self,
+        deployment_name: &str,
+        current_revision: u64,
+    ) -> Vec<crate::models::Pod> {
+        self.pods
+            .values()
+            .filter(|p| {
+                p.deployment_name.as_deref() == Some(deployment_name)
+                    && p.revision < current_revision
+                    && !matches!(
+                        p.status,
+                        crate::models::PodStatus::Terminated
+                            | crate::models::PodStatus::Terminating
+                            | crate::models::PodStatus::Failed
+                    )
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn count_running_pods_for_revision(&self, deployment_name: &str, revision: u64) -> u32 {
+        self.pods
+            .values()
+            .filter(|p| {
+                p.deployment_name.as_deref() == Some(deployment_name)
+                    && p.revision == revision
+                    && p.status == crate::models::PodStatus::Running
+            })
+            .count() as u32
+    }
+
+    /// Count all active (non-terminated/failed) pods with the current revision
+    pub fn count_active_pods_for_revision(&self, deployment_name: &str, revision: u64) -> u32 {
+        self.pods
+            .values()
+            .filter(|p| {
+                p.deployment_name.as_deref() == Some(deployment_name)
+                    && p.revision == revision
+                    && !matches!(
+                        p.status,
+                        crate::models::PodStatus::Terminated | crate::models::PodStatus::Failed
+                    )
+            })
+            .count() as u32
+    }
+
+    pub fn get_old_pods_to_terminate(
+        &self,
+        deployment_name: &str,
+        current_revision: u64,
+        count: u32,
+    ) -> Vec<uuid::Uuid> {
+        let mut pods: Vec<_> = self
+            .pods
+            .values()
+            .filter(|p| {
+                p.deployment_name.as_deref() == Some(deployment_name)
+                    && p.revision < current_revision
+                    && !matches!(
+                        p.status,
+                        crate::models::PodStatus::Terminated
+                            | crate::models::PodStatus::Terminating
+                            | crate::models::PodStatus::Failed
+                    )
+            })
+            .collect();
+
+        // Sort by name descending to terminate newer pods first
+        pods.sort_by(|a, b| b.name.cmp(&a.name));
+
+        pods.into_iter()
+            .take(count as usize)
+            .map(|p| p.id)
+            .collect()
+    }
+
     pub fn get_unassigned_pods(&self) -> Vec<crate::models::Pod> {
         self.pods
             .values()
@@ -241,6 +318,8 @@ mod tests {
                 cpu_millis: 100,
                 memory_mb: 128,
             },
+            rolling_update: crate::models::RollingUpdateConfig::default(),
+            revision: 1,
         };
 
         store.upsert_deployment(deployment);
@@ -267,6 +346,7 @@ mod tests {
             status: crate::models::PodStatus::Pending,
             container_id: None,
             node_name: None,
+            revision: 1,
         };
         let pod_id = pod.id;
 
@@ -295,6 +375,8 @@ mod tests {
                 cpu_millis: 100,
                 memory_mb: 128,
             },
+            rolling_update: crate::models::RollingUpdateConfig::default(),
+            revision: 1,
         };
 
         let pod1 = crate::models::Pod::from_deployment(&deployment, 0);
@@ -378,5 +460,62 @@ mod tests {
         let node = store.get_node("worker-1").unwrap();
         assert_eq!(node.used.cpu_millis, 0);
         assert_eq!(node.used.memory_mb, 0);
+    }
+
+    #[test]
+    fn test_rolling_update_pod_tracking() {
+        let mut store = Store::new();
+
+        let deployment_v1 = crate::models::Deployment {
+            name: "web".to_string(),
+            image: "nginx:1.0".to_string(),
+            replicas: 3,
+            resources: crate::models::Resources {
+                cpu_millis: 100,
+                memory_mb: 128,
+            },
+            rolling_update: crate::models::RollingUpdateConfig::default(),
+            revision: 1,
+        };
+
+        let pod1 = crate::models::Pod::from_deployment(&deployment_v1, 0);
+        let pod2 = crate::models::Pod::from_deployment(&deployment_v1, 1);
+        let pod3 = crate::models::Pod::from_deployment(&deployment_v1, 2);
+
+        store.add_pod(pod1.clone());
+        store.add_pod(pod2.clone());
+        store.add_pod(pod3.clone());
+        store.update_pod_status(&pod1.id, crate::models::PodStatus::Running);
+        store.update_pod_status(&pod2.id, crate::models::PodStatus::Running);
+        store.update_pod_status(&pod3.id, crate::models::PodStatus::Running);
+        let old_pods = store.get_old_revision_pods("web", 1);
+        assert_eq!(old_pods.len(), 0);
+
+        let deployment_v2 = crate::models::Deployment {
+            name: "web".to_string(),
+            image: "nginx:2.0".to_string(),
+            replicas: 3,
+            resources: crate::models::Resources {
+                cpu_millis: 100,
+                memory_mb: 128,
+            },
+            rolling_update: crate::models::RollingUpdateConfig::default(),
+            revision: 2,
+        };
+        let old_pods = store.get_old_revision_pods("web", 2);
+        assert_eq!(old_pods.len(), 3);
+        let new_pod1 = crate::models::Pod::from_deployment(&deployment_v2, 3);
+        store.add_pod(new_pod1.clone());
+        store.update_pod_status(&new_pod1.id, crate::models::PodStatus::Running);
+        assert_eq!(store.count_running_pods_for_revision("web", 1), 3);
+        assert_eq!(store.count_running_pods_for_revision("web", 2), 1);
+        assert_eq!(store.count_active_pods_for_revision("web", 2), 1);
+
+        let to_terminate = store.get_old_pods_to_terminate("web", 2, 1);
+        assert_eq!(to_terminate.len(), 1);
+        store.update_pod_status(&to_terminate[0], crate::models::PodStatus::Terminated);
+
+        let old_pods = store.get_old_revision_pods("web", 2);
+        assert_eq!(old_pods.len(), 2);
     }
 }

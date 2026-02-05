@@ -1010,6 +1010,227 @@ test_resource_exhaustion_scheduling() {
     return 1
 }
 
+test_rolling_update() {
+    log_info "Testing rolling update"
+
+    local http_code
+    http_code=$(curl -s -o /tmp/rolling_create.json -w "%{http_code}" \
+        -X POST "${KAGO_SERVER}/deployments" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "name": "'"${TEST_CONTAINER_PREFIX}"'rolling",
+            "image": "nginx:1.24-alpine",
+            "replicas": 3,
+            "resources": {
+                "cpu_millis": 100,
+                "memory_mb": 64
+            },
+            "rolling_update": {
+                "max_surge": 1,
+                "max_unavailable": 0
+            }
+        }')
+
+    assert_eq "201" "${http_code}" "Should create deployment" || return 1
+
+    local max_attempts=30
+    local attempt=1
+
+    log_info "Waiting for initial deployment to be ready..."
+    while [[ ${attempt} -le ${max_attempts} ]]; do
+        local response
+        response=$(curl -s "${KAGO_SERVER}/pods")
+
+        local running_count
+        running_count=$(echo "${response}" | jq '[.[] | select(.deployment_name == "'"${TEST_CONTAINER_PREFIX}"'rolling" and .status == "running")] | length')
+
+        if [[ "${running_count}" -ge 3 ]]; then
+            log_info "Initial deployment ready: ${running_count} pods running"
+            break
+        fi
+
+        log_info "Running pods: ${running_count}/3 (attempt ${attempt}/${max_attempts})"
+        sleep 2
+        ((attempt++))
+    done
+
+    if [[ ${attempt} -gt ${max_attempts} ]]; then
+        log_error "Initial deployment did not become ready"
+        curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling" > /dev/null
+        return 1
+    fi
+
+    # Check initial revision
+    local deployment_response
+    deployment_response=$(curl -s "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling")
+    local initial_revision
+    initial_revision=$(echo "${deployment_response}" | jq -r '.revision')
+    log_info "Initial revision: ${initial_revision}"
+
+    # Trigger rolling update by changing image
+    log_info "Triggering rolling update: nginx:1.24-alpine -> nginx:1.25-alpine"
+    http_code=$(curl -s -o /tmp/rolling_update.json -w "%{http_code}" \
+        -X PUT "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling" \
+        -H "Content-Type: application/json" \
+        -d '{"image": "nginx:1.25-alpine"}')
+
+    assert_eq "200" "${http_code}" "Should update deployment" || {
+        curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling" > /dev/null
+        return 1
+    }
+
+    # Check revision was incremented
+    deployment_response=$(curl -s "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling")
+    local new_revision
+    new_revision=$(echo "${deployment_response}" | jq -r '.revision')
+    log_info "New revision: ${new_revision}"
+
+    if [[ "${new_revision}" -le "${initial_revision}" ]]; then
+        log_error "Revision was not incremented: initial=${initial_revision}, new=${new_revision}"
+        curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling" > /dev/null
+        return 1
+    fi
+
+    # Wait for rolling update to complete
+    max_attempts=60
+    attempt=1
+
+    log_info "Waiting for rolling update to complete..."
+    while [[ ${attempt} -le ${max_attempts} ]]; do
+        local response
+        response=$(curl -s "${KAGO_SERVER}/pods")
+
+        # Count pods with new image
+        local new_running
+        new_running=$(echo "${response}" | jq '[.[] | select(.deployment_name == "'"${TEST_CONTAINER_PREFIX}"'rolling" and .status == "running" and .image == "nginx:1.25-alpine")] | length')
+
+        # Count pods with old image
+        local old_active
+        old_active=$(echo "${response}" | jq '[.[] | select(.deployment_name == "'"${TEST_CONTAINER_PREFIX}"'rolling" and .status != "terminated" and .status != "failed" and .image == "nginx:1.24-alpine")] | length')
+
+        local total_running
+        total_running=$(echo "${response}" | jq '[.[] | select(.deployment_name == "'"${TEST_CONTAINER_PREFIX}"'rolling" and .status == "running")] | length')
+
+        log_info "Rolling update progress: new_running=${new_running}, old_active=${old_active}, total_running=${total_running} (attempt ${attempt}/${max_attempts})"
+
+        if [[ "${total_running}" -lt 2 ]] && [[ ${attempt} -gt 5 ]]; then
+            log_warn "Low availability during rolling update: ${total_running} running pods"
+        fi
+
+        # Rolling update complete when all 3 pods are running with new image and no old pods remain
+        if [[ "${new_running}" -ge 3 ]] && [[ "${old_active}" -eq 0 ]]; then
+            log_info "Rolling update complete: ${new_running} pods running with new image"
+
+            deployment_response=$(curl -s "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling")
+            local updated_replicas
+            updated_replicas=$(echo "${deployment_response}" | jq -r '.updated_replicas')
+            log_info "Deployment shows updated_replicas: ${updated_replicas}"
+
+            curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling" > /dev/null
+            sleep 5
+            return 0
+        fi
+
+        sleep 2
+        ((attempt++))
+    done
+
+    log_error "Rolling update did not complete within ${max_attempts} attempts"
+    curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling" > /dev/null 2>&1 || true
+    return 1
+}
+
+test_rolling_update_with_max_unavailable() {
+    log_info "Testing rolling update with max_unavailable=1"
+
+    local http_code
+    http_code=$(curl -s -o /tmp/rolling2_create.json -w "%{http_code}" \
+        -X POST "${KAGO_SERVER}/deployments" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "name": "'"${TEST_CONTAINER_PREFIX}"'rolling2",
+            "image": "httpd:2.4-alpine",
+            "replicas": 3,
+            "resources": {
+                "cpu_millis": 100,
+                "memory_mb": 64
+            },
+            "rolling_update": {
+                "max_surge": 1,
+                "max_unavailable": 1
+            }
+        }')
+
+    assert_eq "201" "${http_code}" "Should create deployment" || return 1
+
+    local max_attempts=30
+    local attempt=1
+
+    log_info "Waiting for initial deployment to be ready..."
+    while [[ ${attempt} -le ${max_attempts} ]]; do
+        local response
+        response=$(curl -s "${KAGO_SERVER}/pods")
+
+        local running_count
+        running_count=$(echo "${response}" | jq '[.[] | select(.deployment_name == "'"${TEST_CONTAINER_PREFIX}"'rolling2" and .status == "running")] | length')
+
+        if [[ "${running_count}" -ge 3 ]]; then
+            log_info "Initial deployment ready: ${running_count} pods running"
+            break
+        fi
+
+        sleep 2
+        ((attempt++))
+    done
+
+    if [[ ${attempt} -gt ${max_attempts} ]]; then
+        log_error "Initial deployment did not become ready"
+        curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling2" > /dev/null
+        return 1
+    fi
+
+    log_info "Triggering rolling update with max_unavailable=1"
+    http_code=$(curl -s -o /tmp/rolling2_update.json -w "%{http_code}" \
+        -X PUT "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling2" \
+        -H "Content-Type: application/json" \
+        -d '{"image": "httpd:2.4.58-alpine"}')
+
+    assert_eq "200" "${http_code}" "Should update deployment" || {
+        curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling2" > /dev/null
+        return 1
+    }
+
+    max_attempts=60
+    attempt=1
+
+    while [[ ${attempt} -le ${max_attempts} ]]; do
+        local response
+        response=$(curl -s "${KAGO_SERVER}/pods")
+
+        local new_running
+        new_running=$(echo "${response}" | jq '[.[] | select(.deployment_name == "'"${TEST_CONTAINER_PREFIX}"'rolling2" and .status == "running" and .image == "httpd:2.4.58-alpine")] | length')
+
+        local old_active
+        old_active=$(echo "${response}" | jq '[.[] | select(.deployment_name == "'"${TEST_CONTAINER_PREFIX}"'rolling2" and .status != "terminated" and .status != "failed" and .image == "httpd:2.4-alpine")] | length')
+
+        log_info "Rolling update (max_unavailable=1): new_running=${new_running}, old_active=${old_active} (attempt ${attempt}/${max_attempts})"
+
+        if [[ "${new_running}" -ge 3 ]] && [[ "${old_active}" -eq 0 ]]; then
+            log_info "Rolling update with max_unavailable=1 complete"
+            curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling2" > /dev/null
+            sleep 5
+            return 0
+        fi
+
+        sleep 2
+        ((attempt++))
+    done
+
+    log_error "Rolling update did not complete"
+    curl -s -X DELETE "${KAGO_SERVER}/deployments/${TEST_CONTAINER_PREFIX}rolling2" > /dev/null 2>&1 || true
+    return 1
+}
+
 test_insufficient_resources_not_scheduled() {
     log_info "Testing that pods with excessive resource requirements stay pending"
 
@@ -1150,6 +1371,13 @@ main() {
 
     run_test "Scheduler strategy configured" test_scheduler_strategy_configured || true
     run_test "Resource-based scheduling" test_resource_based_scheduling || true
+
+    log_info ""
+    log_section "Rolling Update Tests"
+    log_info "================================"
+
+    run_test "Rolling update" test_rolling_update || true
+    run_test "Rolling update with max_unavailable" test_rolling_update_with_max_unavailable || true
 
     if [[ "${run_multi_node}" == "true" ]]; then
         log_info ""

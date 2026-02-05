@@ -8,7 +8,8 @@ pub(super) async fn list_deployments(
         .into_iter()
         .map(|d| {
             let ready = store.count_running_pods_for_deployment(&d.name);
-            crate::models::DeploymentResponse::from_deployment(&d, ready)
+            let updated = store.count_running_pods_for_revision(&d.name, d.revision);
+            crate::models::DeploymentResponse::from_deployment(&d, ready, updated)
         })
         .collect();
 
@@ -50,6 +51,8 @@ pub(super) async fn create_deployment(
         image: req.image,
         replicas: req.replicas,
         resources: req.resources,
+        rolling_update: req.rolling_update,
+        revision: 1,
     };
 
     let response_body = serde_json::json!({
@@ -82,7 +85,9 @@ pub(super) async fn get_deployment(
     match store.get_deployment(&name) {
         Some(deployment) => {
             let ready = store.count_running_pods_for_deployment(&name);
-            let response = crate::models::DeploymentResponse::from_deployment(deployment, ready);
+            let updated = store.count_running_pods_for_revision(&name, deployment.revision);
+            let response =
+                crate::models::DeploymentResponse::from_deployment(deployment, ready, updated);
             (
                 axum::http::StatusCode::OK,
                 axum::Json(serde_json::to_value(response).unwrap()),
@@ -106,24 +111,47 @@ pub(super) async fn update_deployment(
 
     match store.get_deployment(&name).cloned() {
         Some(mut deployment) => {
+            let mut image_changed = false;
+
             if let Some(replicas) = req.replicas {
                 deployment.replicas = replicas;
             }
-            if let Some(image) = req.image {
+            if let Some(image) = req.image
+                && image != deployment.image
+            {
+                image_changed = true;
                 deployment.image = image;
+                deployment.revision += 1;
+                tracing::info!(
+                    "Deployment {} image changed, incrementing revision to {}",
+                    name,
+                    deployment.revision
+                );
             }
 
             store.upsert_deployment(deployment.clone());
 
             let ready = store.count_running_pods_for_deployment(&name);
-            let response = crate::models::DeploymentResponse::from_deployment(&deployment, ready);
+            let updated = store.count_running_pods_for_revision(&name, deployment.revision);
+            let response =
+                crate::models::DeploymentResponse::from_deployment(&deployment, ready, updated);
 
-            tracing::info!(
-                "Deployment {} updated: replicas={}, image={}",
-                name,
-                deployment.replicas,
-                deployment.image
-            );
+            if image_changed {
+                tracing::info!(
+                    "Deployment {} updated: replicas={}, image={}, revision={} (rolling update triggered)",
+                    name,
+                    deployment.replicas,
+                    deployment.image,
+                    deployment.revision
+                );
+            } else {
+                tracing::info!(
+                    "Deployment {} updated: replicas={}, image={}",
+                    name,
+                    deployment.replicas,
+                    deployment.image
+                );
+            }
 
             (
                 axum::http::StatusCode::OK,
